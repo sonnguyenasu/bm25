@@ -1,65 +1,89 @@
-use std::collections::{BinaryHeap};
-use rustc_hash::FxHashMap;
-use std::cmp::Reverse;
+use std::{cmp::Reverse, collections::BinaryHeap};
+
 use ordered_float::OrderedFloat;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-
-pub struct BM25Okapi{
-    pub corpus: Vec<Vec<String>>,
-    pub k1: f64,
-    pub b: f64,
-    pub avgdl: f64,
-    pub idf: FxHashMap<String, f64>,
-    pub doc_freq: Vec<FxHashMap<String, u32>>,
+#[derive(Debug)]
+pub struct DocumentIndex{
+    // score is just the sum of score of each word in the query
+    // pub scores: HashMap<&'static str, f64>,
+    pub index: usize,
+    pub term_freq: FxHashMap<&'static str, usize>,
+    pub doc_len: usize,
 }
 
-impl BM25Okapi{
-    pub fn new(corpus: &Vec<String>, k1: f64, b: f64) -> Self{
-        let corpus: Vec<_> = corpus.iter()
-        .map(|doc| doc.split_whitespace().map(|s| s.to_string()).collect())
-        .collect();
-        let avgdl = corpus.iter().map(|doc: &Vec<String>| doc.len()).sum::<usize>() as f64 / corpus.len() as f64;
-        let mut doc_freq = Vec::with_capacity(corpus.len());
-        let mut nd = FxHashMap::default();
-        for doc in corpus.iter(){
-            let mut doc_freq_map = FxHashMap::default();
-            for term in doc.iter(){
-                *nd.entry(term.clone()).or_insert(0) += 1;
-                *doc_freq_map.entry(term.clone()).or_insert(0) += 1;
-            }
-            doc_freq.push(doc_freq_map);
+
+#[derive(Debug)]
+pub struct OkapiBM25{
+    // for each document, there is a Document Index that is inserted each time it is inserted 
+    pub indices: Vec<DocumentIndex>,
+    // we store the idf score of words to this idf hashmap so the query time is reduced
+    pub idf: FxHashMap<&'static str, f64>,
+    // to compute idf, we are interested in how many document contain a word
+    doc_freq: FxHashMap<&'static str, usize>,
+    // k1, b, avgdl
+    k1: f64,
+    b: f64,
+    avgdl: f64,
+}
+
+impl OkapiBM25{
+    pub fn new(k1: f64, b: f64) -> Self {
+        OkapiBM25{
+            indices: Vec::new(),
+            idf: FxHashMap::default(),
+            doc_freq: FxHashMap::default(), 
+            avgdl: 0.0,
+            k1, b
         }
-        let idf = BM25Okapi::calc_idf(nd, corpus.len() as f64);//HashMap::new();
-        Self{corpus, k1, b, avgdl, idf, doc_freq}
     }
 
-    fn calc_idf(corpus: FxHashMap<String, usize>, doc_len: f64) -> FxHashMap<String, f64>{
-        let mut idf = FxHashMap::default();
-        // let n = corpus.len() as f64;
-        for (term, freq) in corpus.iter(){
-            idf.insert(term.clone(), ((doc_len - *freq as f64 + 0.5) / (*freq as f64 + 0.5) + 1.0).ln());
-        }
-        idf
+    pub fn len(&self) -> usize{
+        self.indices.len()
+    }
+
+    pub fn insert(&mut self, new_doc: &'static str){
+        // get index of the new document and size of the current indices database
+        let index = self.len();
+        let updated_num_doc = index + 1;
+        // get the words
+        let word_set = new_doc.split_whitespace().collect::<FxHashSet<_>>();
+        let word_list = new_doc.split_whitespace().collect::<Vec<_>>();
+        // update doc freq
+        word_set.iter().for_each(|w| {
+            let freq = self.doc_freq.entry(w).or_insert(0);
+            *freq += 1;
+            let new_idf = (self.k1+1.0)*(((updated_num_doc as f64) +1.0) / (*freq as f64 + 0.5)).ln();
+            self.idf.insert(w, new_idf);
+        });
+        // update avg length
+        self.avgdl = self.avgdl - (self.avgdl - word_list.len() as f64) / updated_num_doc as f64;
+       
+        let mut new_doc = DocumentIndex{
+            index,
+            term_freq: FxHashMap::default(),
+            doc_len: word_list.len(),
+        };
+        word_list.iter().for_each(|word|{
+            *new_doc.term_freq.entry(word).or_insert(0) += 1;
+        });
+        self.indices.push(new_doc);
     }
 
     pub fn search(&self, query: &str, top_k: usize)-> Vec<(usize,OrderedFloat<f64>)>{
         let query_words: Vec<_> = query.split_whitespace().collect();
-
-        let idfs: Vec<_> = query_words.iter()
-                            .map(|&w| {
-                                self.idf.get(w).unwrap_or(&0.0)
-                            }).collect();
+        let query_idfs: Vec<_> = query_words.iter().map(|w| {
+            *self.idf.get(w).unwrap_or(&0.0)
+        }).collect();
 
         let mut top_k_docs = BinaryHeap::new();
         
-        for (idx,(doc, doc_freq)) in self.corpus.iter().zip(self.doc_freq.iter()).enumerate(){
-            let scale = doc.len() as f64 / self.avgdl;
+        for (idx, doc) in self.indices.iter().enumerate(){
+            let scaled_value = self.k1*(1.0-self.b+self.b*doc.doc_len as f64 / self.avgdl);
             let mut score = 0.0;
-            for (i, &word) in query_words.iter().enumerate(){
-                if let Some(&freq) = doc_freq.get(word){
-                    let freq = freq as f64;
-                    let idf = idfs[i];//.get(i).unwrap();
-                    score += idf*(self.k1+1.0) / (1.0 + self.k1*(1.0-self.b+self.b*scale)/freq);
+            for (i,&word) in query_words.iter().enumerate(){
+                if let Some(&freq) = doc.term_freq.get(word){
+                    score += query_idfs[i] / (1.0 + scaled_value/freq as f64);
                 }
             }
             if top_k_docs.len() < top_k as usize {
@@ -70,9 +94,7 @@ impl BM25Okapi{
                     top_k_docs.push(Reverse((idx,OrderedFloat(score))));
                 }
             }
-            // scores
         }
-        // top_k_docs.into_iter().map(|Reverse((doc_id, score))| (score, doc_id as u32)).collect()
         let mut results = Vec::new();
         while let Some(Reverse((doc_id, score))) = top_k_docs.pop() {
             results.push((doc_id, score));
@@ -84,33 +106,3 @@ impl BM25Okapi{
 
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-
-//     #[test]
-//     fn test_bm25(){
-//         let corpus = vec![
-//             "hello world".to_string(),
-//             "world world world".to_string(),
-//             "hello hello world".to_string(),
-//         ];
-//         let bm25 = BM25Okapi::new(&corpus, 1.2, 0.75);
-//         eprintln!("{:?}", bm25.idf);
-//         assert_eq!(bm25.corpus.len(), 3);
-//         assert_eq!(bm25.avgdl, 2.6666666666666665);
-//         // assert_eq!(bm25.idf["hello"], 0.6);
-//     }
-
-//     #[test]
-//     fn test_load_bm25(){
-//         let corpus: Vec<_> = include_str!("../train.csv").lines().skip(1)
-//         .map(|line| line.split(",").nth(2).unwrap().to_string()).collect();
-//         let time = std::time::Instant::now();
-//         let bm25 = BM25Okapi::new(&corpus, 1.2, 0.75);
-//         let took = time.elapsed().as_secs();
-//         println!("{:?} doc loaded in {} seconds", bm25.corpus.len(), took);
-//         println!("{}", bm25.get_scores("united")[0]);
-//         assert!(true);
-//     }
-// }
